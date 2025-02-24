@@ -52,6 +52,8 @@ class ARCroco3DStereoOutput(ModelOutput):
 
     ress: Optional[List[Any]] = None
     views: Optional[List[Any]] = None
+    Ft_prime: Optional[torch.Tensor] = None  # enriched image tokens (F_t')
+    zt_prime: Optional[torch.Tensor] = None  # enriched pose token (z_t')
 
 
 def strip_module(state_dict):
@@ -821,6 +823,7 @@ class ARCroco3DStereo(CroCoNet):
         init_mem = mem.clone()
         all_state_args = [(state_feat, state_pos, init_state_feat, mem, init_mem)]
         ress = []
+        final_dec = None  # will hold the final decoder output
         for i in range(len(views)):
             feat_i = feat[i]
             pos_i = pos[i]
@@ -830,9 +833,7 @@ class ARCroco3DStereo(CroCoNet):
                     pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
                 else:
                     pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
-                pose_pos_i = -torch.ones(
-                    feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
-                )
+                pose_pos_i = -torch.ones(feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype)
             else:
                 pose_feat_i = None
                 pose_pos_i = None
@@ -848,14 +849,13 @@ class ARCroco3DStereo(CroCoNet):
                 reset_mask=views[i]["reset"],
                 update=views[i].get("update", None),
             )
-            out_pose_feat_i = dec[-1][:, 0:1]
-            new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i
-            )
-            assert len(dec) == self.dec_depth + 1
+            # Capture the final decoder output from this iteration.
+            final_dec = dec  
+            out_pose_feat_i = dec[-1][:, 0:1]  # first token: enriched pose token
+            new_mem = self.pose_retriever.update_mem(mem, global_img_feat_i, out_pose_feat_i)
             head_input = [
                 dec[0].float(),
-                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),  # tokens excluding the first token
                 dec[self.dec_depth * 3 // 4][:, 1:].float(),
                 dec[self.dec_depth].float(),
             ]
@@ -864,39 +864,35 @@ class ARCroco3DStereo(CroCoNet):
             img_mask = views[i]["img_mask"]
             update = views[i].get("update", None)
             if update is not None:
-                update_mask = (
-                    img_mask & update
-                )  # if don't update, then whatever img_mask
+                update_mask = img_mask & update
             else:
                 update_mask = img_mask
             update_mask = update_mask[:, None, None].float()
-            state_feat = new_state_feat * update_mask + state_feat * (
-                1 - update_mask
-            )  # update global state
-            mem = new_mem * update_mask + mem * (
-                1 - update_mask
-            )  # then update local state
+            state_feat = new_state_feat * update_mask + state_feat * (1 - update_mask)
+            mem = new_mem * update_mask + mem * (1 - update_mask)
             reset_mask = views[i]["reset"]
             if reset_mask is not None:
                 reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
-                )
+                state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
-            all_state_args.append(
-                (state_feat, state_pos, init_state_feat, mem, init_mem)
-            )
+            all_state_args.append((state_feat, state_pos, init_state_feat, mem, init_mem))
         if ret_state:
-            return ress, views, all_state_args
-        return ress, views
+            return ress, views, all_state_args, final_dec
+        return ress, views, final_dec
 
     def forward(self, views, ret_state=False):
         if ret_state:
-            ress, views, state_args = self._forward_impl(views, ret_state=ret_state)
-            return ARCroco3DStereoOutput(ress=ress, views=views), state_args
+            ress, views, state_args, final_dec = self._forward_impl(views, ret_state=ret_state)
+            # Extract the enriched features from final_dec:
+            zt_prime = final_dec[-1][:, 0:1]  # first token as pose token
+            ft_prime = final_dec[-1][:, 1:]   # remaining tokens as enriched image tokens
+            return ARCroco3DStereoOutput(ress=ress, views=views, Ft_prime=ft_prime, zt_prime=zt_prime), state_args
         else:
-            ress, views = self._forward_impl(views, ret_state=ret_state)
-            return ARCroco3DStereoOutput(ress=ress, views=views)
+            ress, views, final_dec = self._forward_impl(views, ret_state=ret_state)
+            zt_prime = final_dec[-1][:, 0:1]
+            ft_prime = final_dec[-1][:, 1:]
+            return ARCroco3DStereoOutput(ress=ress, views=views, Ft_prime=ft_prime, zt_prime=zt_prime)
+
 
     def inference_step(
         self, view, state_feat, state_pos, init_state_feat, mem, init_mem
